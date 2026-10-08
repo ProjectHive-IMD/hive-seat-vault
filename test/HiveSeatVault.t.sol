@@ -26,7 +26,8 @@ contract MockToken is ERC20 {
 
 contract MockAdapter is IImdAgentAdapter {
     uint256 public n = 52000;
-    function register(uint256, address, uint256, string calldata) external returns (uint256) {
+    // matches the live Adapter8004 ABI: first arg is uint8 (TokenStandard enum)
+    function register(uint8, address, uint256, string calldata) external returns (uint256) {
         return ++n;
     }
 }
@@ -104,7 +105,9 @@ contract HiveSeatVaultTest is Test {
         vm.prank(operator);
         bytes32 digest = vault.authorizeWorker(_auth(SEAT_ID));
         assertEq(vault.isValidSignature(digest, ""), bytes4(0x1626ba7e));
-        assertEq(vault.authorizedTokenId(digest), SEAT_ID);
+        (bool ok, uint256 tid) = vault.authorizedTokenId(digest);
+        assertTrue(ok);
+        assertEq(tid, SEAT_ID);
     }
 
     function test_random_hash_is_invalid() public view {
@@ -235,5 +238,81 @@ contract HiveSeatVaultTest is Test {
         vm.prank(timelock);
         vault.setEnsName("hivevault.eth");
         assertEq(ens.last(), "hivevault.eth");
+    }
+
+    /* ---- pairing freshness: finding #2 / I8 ---- */
+    function test_pairing_expires_on_chain() public {
+        vm.prank(operator);
+        bytes32 digest = vault.authorizeWorker(_auth(SEAT_ID));
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0x1626ba7e));
+        vm.warp(block.timestamp + 2 hours); // past expiresAt (set to now + 1h)
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0xffffffff));
+        (bool ok,) = vault.authorizedTokenId(digest);
+        assertFalse(ok);
+    }
+
+    function test_rotating_operator_retires_pairings() public {
+        vm.prank(operator);
+        bytes32 digest = vault.authorizeWorker(_auth(SEAT_ID));
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0x1626ba7e));
+        // rotating the hot key neutralises a leaked key immediately — even before the pairing's own expiry
+        vm.prank(timelock);
+        vault.setSeatOperator(makeAddr("newOperator"));
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0xffffffff));
+    }
+
+    function test_redeposit_does_not_rearm_old_pairing() public {
+        vm.prank(operator);
+        bytes32 digest = vault.authorizeWorker(_auth(SEAT_ID));
+        vm.prank(timelock);
+        vault.withdrawSeat(SEAT_ID, treasury);
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0xffffffff));
+        // re-deposit the same seat: the old digest must NOT silently come back to life
+        vm.prank(treasury);
+        seat.safeTransferFrom(treasury, address(vault), SEAT_ID);
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0xffffffff));
+    }
+
+    /* ---- ownership hardening: finding #3 ---- */
+    function test_renounce_ownership_disabled() public {
+        vm.prank(timelock);
+        vm.expectRevert(HiveSeatVault.OwnershipCannotBeRenounced.selector);
+        vault.renounceOwnership();
+        assertEq(vault.owner(), timelock);
+    }
+
+    /* ---- ETH path + NFT rescue: finding #4 ---- */
+    function test_eth_received_and_swept_to_sink() public {
+        vm.deal(address(this), 1 ether);
+        (bool sent,) = address(vault).call{value: 1 ether}("");
+        assertTrue(sent, "vault must accept ETH");
+        assertEq(address(vault).balance, 1 ether);
+        vault.sweepETH(); // permissionless, fixed destination
+        assertEq(address(vault).balance, 0);
+        assertEq(sink.balance, 1 ether);
+    }
+
+    function test_rescue_foreign_nft_but_never_seats() public {
+        MockOtherNft other = new MockOtherNft();
+        other.mint(address(this), 7);
+        other.transferFrom(address(this), address(vault), 7); // unsafe path bypasses onERC721Received
+        assertEq(other.ownerOf(7), address(vault));
+        // owner (timelock) can rescue a stray NFT...
+        vm.prank(timelock);
+        vault.rescueERC721(IERC721(address(other)), 7, treasury);
+        assertEq(other.ownerOf(7), treasury);
+        // ...but rescue can NEVER be used on the seat collection (I1)
+        vm.prank(timelock);
+        vm.expectRevert(HiveSeatVault.CannotRescueSeats.selector);
+        vault.rescueERC721(IERC721(address(seat)), SEAT_ID, treasury);
+        assertEq(seat.ownerOf(SEAT_ID), address(vault));
+    }
+
+    function test_rescue_only_owner() public {
+        MockOtherNft other = new MockOtherNft();
+        other.mint(address(vault), 8);
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        vault.rescueERC721(IERC721(address(other)), 8, attacker);
     }
 }

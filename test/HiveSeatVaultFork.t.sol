@@ -31,9 +31,16 @@ contract HiveSeatVaultForkTest is Test {
     address operator = makeAddr("operator");
     address sink = makeAddr("sink");
     address realAdapter;
+    bool internal forked;
 
     function setUp() public {
-        vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com")));
+        // Skip the whole suite cleanly when there's no RPC (offline CI) instead of reporting FAILED.
+        try vm.createSelectFork(vm.envOr("ETH_RPC_URL", string("https://ethereum-rpc.publicnode.com"))) returns (uint256) {
+            forked = true;
+        } catch {
+            emit log("no ETH RPC reachable; skipping the HiveSeatVault fork suite");
+            return;
+        }
         realAdapter = IRefStrategy(REF_STRATEGY).IMD_AGENT_ADAPTER();
         console2.log("live IMD_AGENT_ADAPTER:", realAdapter);
         vault = new HiveSeatVault(
@@ -53,7 +60,8 @@ contract HiveSeatVaultForkTest is Test {
     }
 
     /// Our digest must equal the live, audited, IMD-accepted contract's for the same authorization.
-    function test_fork_digest_matches_live_reference() public view {
+    function test_fork_digest_matches_live_reference() public {
+        if (!forked) { vm.skip(true); return; }
         HiveSeatVault.WorkerAuthorization memory a = _auth();
         bytes32 ours = vault.workerAuthorizationDigest(a);
         bytes32 refDigest = IRefStrategy(REF_STRATEGY).workerAuthorizationDigest(a);
@@ -62,6 +70,7 @@ contract HiveSeatVaultForkTest is Test {
 
     /// Real seat, real collection: deposit -> operator authorizes -> ERC-1271 accepts.
     function test_fork_real_seat_pairs() public {
+        if (!forked) { vm.skip(true); return; }
         vm.prank(TREASURY);
         IERC721(IMD_NFT).safeTransferFrom(TREASURY, address(vault), SEAT);
         assertEq(IERC721(IMD_NFT).ownerOf(SEAT), address(vault), "seat not custodied");
@@ -73,11 +82,24 @@ contract HiveSeatVaultForkTest is Test {
 
     /// The seat can still only leave via the timelocked owner, even with a real collection.
     function test_fork_operator_cannot_withdraw_real_seat() public {
+        if (!forked) { vm.skip(true); return; }
         vm.prank(TREASURY);
         IERC721(IMD_NFT).safeTransferFrom(TREASURY, address(vault), SEAT);
         vm.prank(operator);
         vm.expectRevert();
         vault.withdrawSeat(SEAT, operator);
         assertEq(IERC721(IMD_NFT).ownerOf(SEAT), address(vault));
+    }
+
+    /// Registering an agent must actually work against the LIVE adapter ABI. This is exactly the audit's
+    /// high finding: the interface was register(uint256,...) but the live Adapter8004 is register(uint8,...).
+    /// The old unit MockAdapter mirrored the wrong signature, so only a real-adapter fork test catches it.
+    function test_fork_registerAgent_against_live_adapter() public {
+        if (!forked) { vm.skip(true); return; }
+        vm.prank(TREASURY);
+        IERC721(IMD_NFT).safeTransferFrom(TREASURY, address(vault), SEAT);
+        vm.prank(operator);
+        uint256 agentId = vault.registerAgent(SEAT, "ipfs://hive-agent");
+        assertGt(agentId, 0, "registerAgent must return a real agentId from the live adapter");
     }
 }
