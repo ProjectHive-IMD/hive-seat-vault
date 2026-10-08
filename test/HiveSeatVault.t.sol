@@ -377,4 +377,57 @@ contract HiveSeatVaultTest is Test {
         vm.expectRevert(HiveSeatVault.ZeroAddress.selector);
         new HiveSeatVault(timelock, IERC721(address(seat)), IImdAgentAdapter(address(0)), ens, sink);
     }
+
+    /* ---- final-audit low #1: owner can correct an orphaned agent by id ---- */
+    function test_owner_can_correct_orphaned_agent_by_id() public {
+        vm.prank(operator);
+        uint256 idA = vault.registerAgent(SEAT_ID, "ipfs://poison");
+        // owner force re-registers -> agentIdOf points at B, A is orphaned
+        vm.prank(timelock);
+        uint256 idB = vault.registerAgent(SEAT_ID, "ipfs://owner");
+        assertEq(vault.agentIdOf(SEAT_ID), idB);
+        // the by-tokenId correction only reaches the latest (B)
+        vm.prank(timelock);
+        vault.setAgentURI(SEAT_ID, "ipfs://good");
+        assertEq(adapter.uriOf(idB), "ipfs://good");
+        assertEq(adapter.uriOf(idA), "ipfs://poison");
+        // ...but setAgentURIById reaches the orphaned first agent A
+        vm.prank(timelock);
+        vault.setAgentURIById(idA, "ipfs://fixed");
+        assertEq(adapter.uriOf(idA), "ipfs://fixed");
+    }
+
+    function test_setAgentURIById_only_owner() public {
+        vm.prank(operator);
+        uint256 id = vault.registerAgent(SEAT_ID, "ipfs://x");
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, operator));
+        vault.setAgentURIById(id, "ipfs://y");
+    }
+
+    /* ---- final-audit low #2: ownership handover retires pairings ---- */
+    function test_ownership_handover_retires_pairings() public {
+        // the owner (Timelock) makes a pairing
+        vm.prank(timelock);
+        bytes32 digest = vault.authorizeWorker(_auth(SEAT_ID));
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0x1626ba7e));
+        // hand ownership to a new Timelock (two-step)
+        address timelock2 = makeAddr("timelock2");
+        vm.prank(timelock);
+        vault.transferOwnership(timelock2);
+        vm.prank(timelock2);
+        vault.acceptOwnership();
+        assertEq(vault.owner(), timelock2);
+        // the previous owner's pairing is retired by the handover (authEpoch bumped)
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0xffffffff));
+    }
+
+    /* ---- final-audit info #7: setEnsName guard ---- */
+    function test_setEnsName_reverts_without_registrar() public {
+        HiveSeatVault v2 =
+            new HiveSeatVault(timelock, IERC721(address(seat)), adapter, IEnsReverseRegistrar(address(0)), sink);
+        vm.prank(timelock);
+        vm.expectRevert(HiveSeatVault.EnsNotConfigured.selector);
+        v2.setEnsName("hive.eth");
+    }
 }

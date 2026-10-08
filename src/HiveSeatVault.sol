@@ -50,11 +50,11 @@ interface IEnsReverseRegistrar {
  *    I6. setSeatOperator / setRewardSink / withdrawSeat / setEnsName / rescueERC721 are all onlyOwner
  *        (delayed + public). renounceOwnership() is disabled, so the Timelock can never be dropped.
  *    I7. Non-upgradeable: no proxy, no delegatecall, no selfdestruct. The rules cannot change silently.
- *    I8. A pairing is VALID only while fresh: it expires on-chain at expiresAt, dies when the operator is
- *        CHANGED (authEpoch — any change retires EVERY live pairing, a clean slate, not only the old key's)
- *        and dies when its seat is withdrawn (custodyEpoch) — a re-deposit does NOT re-arm it. A leaked
- *        operator key loses its pairings on rotation; note expiresAt is operator-chosen, so the 48h rotation
- *        (not a pairing's own expiry) is the real neutraliser. (added post-audit 2026-10-08)
+ *    I8. A pairing is VALID only while fresh: it expires on-chain at expiresAt, dies on any operator change
+ *        AND on an ownership handover (authEpoch — either retires EVERY live pairing, a clean slate), and
+ *        dies when its seat is withdrawn (custodyEpoch) — a re-deposit does NOT re-arm it. A leaked operator
+ *        key loses its pairings on rotation; expiresAt is operator-chosen, so the 48h rotation (not a
+ *        pairing's own expiry) is the real neutraliser. (added post-audit 2026-10-08)
  */
 contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
@@ -118,6 +118,7 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     event WorkerAuthorizationRevoked(bytes32 indexed digest);
     event AgentRegistered(uint256 indexed tokenId, uint256 agentId);
     event AgentURIUpdated(uint256 indexed tokenId, uint256 indexed agentId, string agentURI);
+    event AgentURIUpdatedById(uint256 indexed agentId, string agentURI);
     event Swept(address indexed token, uint256 amount, address indexed to);
     event SeatWithdrawn(uint256 indexed tokenId, address indexed to);
     event SeatOperatorUpdated(address indexed operator);
@@ -139,6 +140,7 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     error ETHSweepFailed();
     error AlreadyRegistered();
     error NotRegistered();
+    error EnsNotConfigured();
 
     modifier onlySeatOperator() {
         if (msg.sender != seatOperator && msg.sender != owner()) revert NotSeatOperator();
@@ -230,6 +232,15 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         if (agentId == 0) revert NotRegistered();
         agentAdapter.setAgentURI(agentId, agentURI);
         emit AgentURIUpdated(tokenId, agentId, agentURI);
+    }
+
+    /// @notice Correct the agentURI of ANY agent bound to a seat this vault holds, by agentId — reaches agents
+    ///         orphaned by a forced re-registration or registered before the seat was deposited (audit low #1).
+    ///         The adapter enforces that the vault owns the agent's seat, so this can never touch another
+    ///         holder's agents. onlyOwner = the 48h Timelock.
+    function setAgentURIById(uint256 agentId, string calldata agentURI) external onlyOwner {
+        agentAdapter.setAgentURI(agentId, agentURI);
+        emit AgentURIUpdatedById(agentId, agentURI);
     }
 
     /// @notice EIP-712 digest of a WorkerAuthorization (domain bound to the seat collection, per IMD).
@@ -342,6 +353,14 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         revert OwnershipCannotBeRenounced();
     }
 
+    /// @dev Clean-slate pairings on an ownership handover too: the new Timelock inherits a fresh signer set,
+    ///      not the previous owner's pairings (I8). Runs once in the constructor as well (harmless — no
+    ///      pairings exist yet). The new owner can also revoke any specific digest manually.
+    function _transferOwnership(address newOwner) internal override {
+        unchecked { ++authEpoch; }
+        super._transferOwnership(newOwner);
+    }
+
     /// @notice Recover a NON-seat NFT sent here by mistake (seats can only leave via withdrawSeat). onlyOwner.
     function rescueERC721(IERC721 token, uint256 tokenId, address to) external onlyOwner {
         if (address(token) == address(seatCollection)) revert CannotRescueSeats();
@@ -354,6 +373,7 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
      * ================================================================== */
     /// @notice Set the vault's primary ENS name so it shows branded on OpenSea / explorers.
     function setEnsName(string calldata name) external onlyOwner returns (bytes32) {
+        if (address(ensReverseRegistrar) == address(0)) revert EnsNotConfigured();
         return ensReverseRegistrar.setName(name);
     }
 }
