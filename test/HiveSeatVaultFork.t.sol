@@ -102,4 +102,17 @@ contract HiveSeatVaultForkTest is Test {
         uint256 agentId = vault.registerAgent(SEAT, "ipfs://hive-agent");
         assertGt(agentId, 0, "registerAgent must return a real agentId from the live adapter");
     }
+
+    /// The owner-only URI-correction passthrough must work against the live adapter ABI (setAgentURI).
+    /// Proves the 0x0af28bd3 signature and that the vault (seat owner) is an accepted caller.
+    function test_fork_owner_can_set_agent_uri_live() public {
+        if (!forked) { vm.skip(true); return; }
+        vm.prank(TREASURY);
+        IERC721(IMD_NFT).safeTransferFrom(TREASURY, address(vault), SEAT);
+        vm.prank(operator);
+        vault.registerAgent(SEAT, "ipfs://hive-agent");
+        // Timelock corrects the URI through the live adapter (reverts here would mean a wrong ABI).
+        vm.prank(timelock);
+        vault.setAgentURI(SEAT, "ipfs://hive-agent-v2");
+    }
 }

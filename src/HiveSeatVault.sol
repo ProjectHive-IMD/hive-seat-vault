@@ -16,6 +16,8 @@ interface IImdAgentAdapter {
     function register(uint8 standard, address collection, uint256 tokenId, string calldata agentURI)
         external
         returns (uint256 agentId);
+    /// @dev selector 0x0af28bd3; adapter gates it on collection.ownerOf(tokenId) == caller (= this vault).
+    function setAgentURI(uint256 agentId, string calldata agentURI) external;
 }
 
 /// @notice ENS reverse registrar — lets this contract set its own primary ENS name (cosmetic only).
@@ -38,7 +40,8 @@ interface IEnsReverseRegistrar {
  *    I1. A seat leaves ONLY via withdrawSeat(), which is onlyOwner (= the Timelock). rescueERC721 reverts on
  *        the seat collection, so it is not a second exit.
  *    I2. The vault never approves a seat to anyone (no approve / setApprovalForAll is ever called).
- *    I3. seatOperator's only powers are authorizeWorker / revokeWorkerAuthorization / registerAgent.
+ *    I3. seatOperator's only powers are authorizeWorker / revokeWorkerAuthorization / registerAgent
+ *        (once per seat — no duplicate spam; the owner can force a re-register or correct a URI).
  *    I4. isValidSignature returns VALID only for digests inserted by authorizeWorker — i.e. well-formed
  *        WorkerAuthorizations whose wallet == this and whose token the vault owns. Never an arbitrary hash.
  *        (This is the anti-rug crux: a hot key must never make the vault "sign" a sale / Seaport order.)
@@ -47,9 +50,11 @@ interface IEnsReverseRegistrar {
  *    I6. setSeatOperator / setRewardSink / withdrawSeat / setEnsName / rescueERC721 are all onlyOwner
  *        (delayed + public). renounceOwnership() is disabled, so the Timelock can never be dropped.
  *    I7. Non-upgradeable: no proxy, no delegatecall, no selfdestruct. The rules cannot change silently.
- *    I8. A pairing is VALID only while fresh: it expires on-chain at expiresAt, dies when the operator key is
- *        rotated (authEpoch) and dies when its seat is withdrawn (custodyEpoch) — a re-deposit does NOT
- *        re-arm it. So a leaked operator key is fully neutralised by rotating it. (added post-audit 2026-10-08)
+ *    I8. A pairing is VALID only while fresh: it expires on-chain at expiresAt, dies when the operator is
+ *        CHANGED (authEpoch — any change retires EVERY live pairing, a clean slate, not only the old key's)
+ *        and dies when its seat is withdrawn (custodyEpoch) — a re-deposit does NOT re-arm it. A leaked
+ *        operator key loses its pairings on rotation; note expiresAt is operator-chosen, so the 48h rotation
+ *        (not a pairing's own expiry) is the real neutraliser. (added post-audit 2026-10-08)
  */
 contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
@@ -101,8 +106,9 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     }
 
     mapping(bytes32 => Pairing) private _pairing; // digest => pairing (only authorizeWorker writes it — I4)
-    uint64 public authEpoch; // ++ on setSeatOperator → retires every pairing the previous key made
+    uint64 public authEpoch; // ++ on any operator CHANGE → retires EVERY live pairing (clean slate)
     mapping(uint256 => uint64) public custodyEpoch; // tokenId => ++ on withdrawSeat (a re-deposit won't re-arm)
+    mapping(uint256 => uint256) public agentIdOf; // tokenId => ERC-8004 agentId registered via this vault (0 = none)
 
     /* ------------------------------------------------------------------ *
      *  Events                                                             *
@@ -111,6 +117,7 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     event WorkerAuthorized(uint256 indexed tokenId, bytes32 deviceKey, bytes32 digest);
     event WorkerAuthorizationRevoked(bytes32 indexed digest);
     event AgentRegistered(uint256 indexed tokenId, uint256 agentId);
+    event AgentURIUpdated(uint256 indexed tokenId, uint256 indexed agentId, string agentURI);
     event Swept(address indexed token, uint256 amount, address indexed to);
     event SeatWithdrawn(uint256 indexed tokenId, address indexed to);
     event SeatOperatorUpdated(address indexed operator);
@@ -130,6 +137,8 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     error OwnershipCannotBeRenounced();
     error CannotRescueSeats();
     error ETHSweepFailed();
+    error AlreadyRegistered();
+    error NotRegistered();
 
     modifier onlySeatOperator() {
         if (msg.sender != seatOperator && msg.sender != owner()) revert NotSeatOperator();
@@ -144,6 +153,8 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         address rewardSink_
     ) Ownable(owner_) {
         if (rewardSink_ == address(0)) revert ZeroAddress();
+        if (address(seatCollection_) == address(0)) revert ZeroAddress();
+        if (address(agentAdapter_) == address(0)) revert ZeroAddress();
         seatCollection = seatCollection_;
         agentAdapter = agentAdapter_;
         ensReverseRegistrar = ensReverseRegistrar_;
@@ -196,6 +207,8 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     }
 
     /// @notice Register an ERC-8004 agent for a held seat (needed once for a never-registered seat).
+    /// @dev    Once per seat: a leaked operator key cannot spam duplicate agents. The owner (Timelock) may
+    ///         force a re-registration, and can correct the URI via setAgentURI below.
     function registerAgent(uint256 tokenId, string calldata agentURI)
         external
         onlySeatOperator
@@ -203,9 +216,20 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         returns (uint256 agentId)
     {
         if (seatCollection.ownerOf(tokenId) != address(this)) revert NotNFTOwner();
+        if (agentIdOf[tokenId] != 0 && msg.sender != owner()) revert AlreadyRegistered();
         // standard = 0 (ERC-721) on the live Adapter8004; first arg is uint8 (see IImdAgentAdapter).
         agentId = agentAdapter.register(0, address(seatCollection), tokenId, agentURI);
+        agentIdOf[tokenId] = agentId;
         emit AgentRegistered(tokenId, agentId);
+    }
+
+    /// @notice Correct the agentURI of a seat registered through this vault (e.g. fix a URI set by a leaked
+    ///         operator key). onlyOwner = the 48h Timelock. Scoped to this vault's own registrations.
+    function setAgentURI(uint256 tokenId, string calldata agentURI) external onlyOwner {
+        uint256 agentId = agentIdOf[tokenId];
+        if (agentId == 0) revert NotRegistered();
+        agentAdapter.setAgentURI(agentId, agentURI);
+        emit AgentURIUpdated(tokenId, agentId, agentURI);
     }
 
     /// @notice EIP-712 digest of a WorkerAuthorization (domain bound to the seat collection, per IMD).
@@ -297,10 +321,11 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         emit SeatWithdrawn(tokenId, to);
     }
 
-    /// @notice Rotate / disable (address(0)) the operator hot key.
+    /// @notice Rotate / disable (address(0)) the operator hot key. ANY change clean-slates every live pairing.
     function setSeatOperator(address operator) external onlyOwner {
+        if (operator == seatOperator) return; // no-op: don't needlessly retire every live pairing
         seatOperator = operator;
-        unchecked { ++authEpoch; } // rotating (or disabling) the hot key retires every pairing it made (I8)
+        unchecked { ++authEpoch; } // any operator change retires EVERY live pairing (clean slate), not just the old key's (I8)
         emit SeatOperatorUpdated(operator);
     }
 

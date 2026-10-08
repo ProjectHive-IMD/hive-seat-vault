@@ -26,9 +26,14 @@ contract MockToken is ERC20 {
 
 contract MockAdapter is IImdAgentAdapter {
     uint256 public n = 52000;
+    mapping(uint256 => string) public uriOf;
     // matches the live Adapter8004 ABI: first arg is uint8 (TokenStandard enum)
-    function register(uint8, address, uint256, string calldata) external returns (uint256) {
-        return ++n;
+    function register(uint8, address, uint256, string calldata uri) external returns (uint256) {
+        uriOf[++n] = uri;
+        return n;
+    }
+    function setAgentURI(uint256 agentId, string calldata uri) external {
+        uriOf[agentId] = uri;
     }
 }
 
@@ -314,5 +319,62 @@ contract HiveSeatVaultTest is Test {
         vm.prank(attacker);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
         vault.rescueERC721(IERC721(address(other)), 8, attacker);
+    }
+
+    /* ---- registration hardening: finding #1 ---- */
+    function test_register_agent_rejects_duplicate() public {
+        vm.prank(operator);
+        uint256 id1 = vault.registerAgent(SEAT_ID, "ipfs://one");
+        assertEq(vault.agentIdOf(SEAT_ID), id1);
+        // a leaked operator key cannot spam a second agent for the same seat
+        vm.prank(operator);
+        vm.expectRevert(HiveSeatVault.AlreadyRegistered.selector);
+        vault.registerAgent(SEAT_ID, "ipfs://two");
+        // ...but the owner (Timelock) may force a re-register if ever needed
+        vm.prank(timelock);
+        uint256 id2 = vault.registerAgent(SEAT_ID, "ipfs://owner");
+        assertGt(id2, id1);
+    }
+
+    function test_owner_can_correct_agent_uri() public {
+        vm.prank(operator);
+        uint256 id = vault.registerAgent(SEAT_ID, "ipfs://poison");
+        assertEq(adapter.uriOf(id), "ipfs://poison");
+        // operator cannot correct it
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, operator));
+        vault.setAgentURI(SEAT_ID, "ipfs://good");
+        // owner (Timelock) can
+        vm.prank(timelock);
+        vault.setAgentURI(SEAT_ID, "ipfs://good");
+        assertEq(adapter.uriOf(id), "ipfs://good");
+    }
+
+    function test_setAgentURI_reverts_if_not_registered() public {
+        vm.prank(timelock);
+        vm.expectRevert(HiveSeatVault.NotRegistered.selector);
+        vault.setAgentURI(SEAT_ID, "ipfs://x");
+    }
+
+    /* ---- operator no-op reset: finding #2 ---- */
+    function test_same_operator_reset_is_noop() public {
+        vm.prank(operator);
+        bytes32 digest = vault.authorizeWorker(_auth(SEAT_ID));
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0x1626ba7e));
+        // re-setting the SAME operator address must NOT wipe live pairings
+        vm.prank(timelock);
+        vault.setSeatOperator(operator);
+        assertEq(vault.isValidSignature(digest, ""), bytes4(0x1626ba7e));
+    }
+
+    /* ---- constructor zero-checks: finding #3 ---- */
+    function test_constructor_rejects_zero_collection() public {
+        vm.expectRevert(HiveSeatVault.ZeroAddress.selector);
+        new HiveSeatVault(timelock, IERC721(address(0)), adapter, ens, sink);
+    }
+
+    function test_constructor_rejects_zero_adapter() public {
+        vm.expectRevert(HiveSeatVault.ZeroAddress.selector);
+        new HiveSeatVault(timelock, IERC721(address(seat)), IImdAgentAdapter(address(0)), ens, sink);
     }
 }
