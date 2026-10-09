@@ -25,8 +25,15 @@ import {HiveSeatVault, IImdAgentAdapter, IEnsReverseRegistrar} from "../src/Hive
  *         - No outside admin is left behind: the deployer never keeps DEFAULT_ADMIN_ROLE (checked below).
  *         - HIVE_TIMELOCK_GUARDIAN (optional, recommended): a SEPARATE key granted only CANCELLER_ROLE. It can
  *           cancel a queued operation (e.g. a hostile withdrawSeat or updateDelay from a leaked proposer key)
- *           but cannot queue or execute anything. Without it, the proposer is the only canceller.
- *         - executor = address(0) (default): execution of a READY op is permissionless.
+ *           but can never QUEUE one. Without it, the proposer is the only canceller. A leaked proposer can't be
+ *           rotated out on-chain except by a 48h self-call; the guardian holds it in check by cancelling.
+ *         - executor = address(0) (default): execution of a READY op (48h passed, not cancelled) is open to
+ *           anyone — the guardian included. That is by design: the 48h public wait is the protection, not who
+ *           presses "execute". If a specific executor is set, it must not be the guardian.
+ *         - The require()s at the end run in the forge simulation. After a real broadcast, ALSO verify on-chain
+ *           (an interrupted broadcast could leave the deployer as admin):
+ *             cast call <timelock> "hasRole(bytes32,address)(bool)" 0x0 <deployer>   -> must be false
+ *             cast call <vault> "owner()(address)"                                    -> must be <timelock>
  */
 contract DeployHiveSeatVault is Script {
     // identity.md mainnet addresses (collection is not a proxy; adapter = IMDSeatStrategy.IMD_AGENT_ADAPTER()).
@@ -40,7 +47,12 @@ contract DeployHiveSeatVault is Script {
         address guardian = vm.envOr("HIVE_TIMELOCK_GUARDIAN", address(0)); // cancel-only key (optional)
         address executor = vm.envOr("HIVE_TIMELOCK_EXECUTOR", address(0)); // 0 = permissionless execution
         address ensRegistrar = vm.envOr("ENS_REVERSE_REGISTRAR", address(0)); // optional ENS branding
+        require(proposer != address(0), "proposer must be set");
         require(guardian != proposer, "guardian must be a separate key");
+        require(executor == address(0) || executor != guardian, "guardian must not be the executor");
+        // the collection + adapter below are Ethereum mainnet contracts
+        require(block.chainid == 1, "deploy on Ethereum mainnet only");
+        require(SEAT_COLLECTION.code.length > 0 && AGENT_ADAPTER.code.length > 0, "collection/adapter have no code");
 
         address[] memory proposers = new address[](1);
         proposers[0] = proposer;
