@@ -87,6 +87,7 @@ contract DeployHiveSeatVault is Script {
         require(timelock.getMinDelay() == MIN_DELAY, "delay must be 48h");
         require(!timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), deployer), "deployer must not keep admin");
         require(!timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), proposer), "proposer must not be admin");
+        require(timelock.hasRole(timelock.PROPOSER_ROLE(), proposer), "proposer must hold PROPOSER_ROLE");
         if (guardian != address(0)) {
             require(timelock.hasRole(timelock.CANCELLER_ROLE(), guardian), "guardian must be a canceller");
             require(!timelock.hasRole(timelock.PROPOSER_ROLE(), guardian), "guardian must not propose");
