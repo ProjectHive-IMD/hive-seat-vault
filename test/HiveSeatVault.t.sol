@@ -6,6 +6,7 @@ import {HiveSeatVault, IImdAgentAdapter, IEnsReverseRegistrar} from "../src/Hive
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 /* ----------------------------- mocks ----------------------------- */
@@ -22,6 +23,18 @@ contract MockOtherNft is ERC721 {
 contract MockToken is ERC20 {
     constructor() ERC20("IMD Token", "IMD") {}
     function mint(address to, uint256 amt) external { _mint(to, amt); }
+}
+
+/// Mimics a restricted IMD launch token (e.g. IMDSeatStrategy's): transfers only allowed to/from `router`.
+contract MockRestrictedToken is ERC20 {
+    address public immutable router;
+    error InvalidTransfer();
+    constructor(address r) ERC20("Launch", "LT") { router = r; }
+    function mint(address to, uint256 amt) external { _mint(to, amt); }
+    function _update(address from, address to, uint256 v) internal override {
+        if (from != address(0) && from != router && to != router) revert InvalidTransfer();
+        super._update(from, to, v);
+    }
 }
 
 contract MockAdapter is IImdAgentAdapter {
@@ -429,5 +442,56 @@ contract HiveSeatVaultTest is Test {
         vm.prank(timelock);
         vm.expectRevert(HiveSeatVault.EnsNotConfigured.selector);
         v2.setEnsName("hive.eth");
+    }
+
+    /* ---- routeERC20 (audit 41fa0208 #1: restricted launch tokens) ---- */
+    function test_restricted_launch_token_cannot_sweep_but_owner_can_route() public {
+        address router = makeAddr("launchRouter");
+        MockRestrictedToken lt = new MockRestrictedToken(router);
+        lt.mint(address(vault), 500e18);
+        address[] memory t = new address[](1);
+        t[0] = address(lt);
+        vm.expectRevert(MockRestrictedToken.InvalidTransfer.selector); // plain sweep to the sink is refused
+        vault.sweepEarnings(t);
+        assertEq(lt.balanceOf(address(vault)), 500e18); // stuck but safe
+
+        vm.prank(timelock); // the owner (= Timelock, so queued 48h in real life) routes it to the allowed router
+        vault.routeERC20(lt, router, 500e18);
+        assertEq(lt.balanceOf(router), 500e18);
+        assertEq(lt.balanceOf(address(vault)), 0);
+    }
+
+    function test_routeERC20_only_owner() public {
+        imd.mint(address(vault), 10e18);
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, operator));
+        vault.routeERC20(imd, operator, 10e18);
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        vault.routeERC20(imd, attacker, 10e18);
+        assertEq(imd.balanceOf(address(vault)), 10e18);
+    }
+
+    function test_routeERC20_never_touches_seats_or_zero_address() public {
+        vm.prank(timelock);
+        vm.expectRevert(HiveSeatVault.CannotSweepSeats.selector);
+        vault.routeERC20(IERC20(address(seat)), timelock, SEAT_ID);
+        assertEq(seat.ownerOf(SEAT_ID), address(vault));
+
+        imd.mint(address(vault), 1e18);
+        vm.prank(timelock);
+        vm.expectRevert(HiveSeatVault.ZeroAddress.selector);
+        vault.routeERC20(imd, address(0), 1e18);
+    }
+
+    function test_routeERC20_partial_amount_and_event() public {
+        imd.mint(address(vault), 10e18);
+        address dest = makeAddr("dest");
+        vm.expectEmit(true, true, false, true, address(vault));
+        emit HiveSeatVault.ERC20Routed(address(imd), dest, 4e18);
+        vm.prank(timelock);
+        vault.routeERC20(imd, dest, 4e18);
+        assertEq(imd.balanceOf(dest), 4e18);
+        assertEq(imd.balanceOf(address(vault)), 6e18);
     }
 }

@@ -47,8 +47,9 @@ interface IEnsReverseRegistrar {
  *        (This is the anti-rug crux: a hot key must never make the vault "sign" a sale / Seaport order.)
  *    I5. sweepEarnings can never move a seat: ERC-20 interface only, reverts on the seat collection,
  *        destination is the fixed rewardSink. sweepETH likewise pays only the fixed rewardSink.
- *    I6. setSeatOperator / setRewardSink / withdrawSeat / setEnsName / rescueERC721 are all onlyOwner
- *        (delayed + public). renounceOwnership() is disabled, so the Timelock can never be dropped.
+ *    I6. setSeatOperator / setRewardSink / withdrawSeat / setEnsName / rescueERC721 / routeERC20 are all
+ *        onlyOwner (delayed + public). renounceOwnership() is disabled, so the Timelock can never be dropped.
+ *        routeERC20 reverts on the seat collection, so it is not a seat exit either (I1).
  *    I7. Non-upgradeable: no proxy, no delegatecall, no selfdestruct. The rules cannot change silently.
  *    I8. A pairing is VALID only while fresh: it expires on-chain at expiresAt, dies on any operator change
  *        AND on an ownership handover (authEpoch — either retires EVERY live pairing, a clean slate), and
@@ -124,6 +125,7 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     event SeatOperatorUpdated(address indexed operator);
     event RewardSinkUpdated(address indexed sink);
     event ERC721Rescued(address indexed token, uint256 indexed tokenId, address indexed to);
+    event ERC20Routed(address indexed token, address indexed to, uint256 amount);
 
     /* ------------------------------------------------------------------ *
      *  Errors                                                             *
@@ -295,6 +297,9 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
      * ================================================================== */
     /// @notice Push earned ERC-20s (IMD + launch tokens) to rewardSink. Permissionless; reverts if any
     ///         token is the seat collection. Cannot move a seat (ERC-20 path, fixed destination).
+    ///         Some IMD launch tokens only allow transfers that involve their pool / a registered distributor
+    ///         or router (they revert InvalidTransfer on a plain transfer); those can't be swept here and
+    ///         leave through routeERC20 instead (owner = Timelock, so that route is delayed + public).
     function sweepEarnings(address[] calldata tokens) external nonReentrant {
         address sink = rewardSink;
         for (uint256 i; i < tokens.length; ++i) {
@@ -366,6 +371,17 @@ contract HiveSeatVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         if (address(token) == address(seatCollection)) revert CannotRescueSeats();
         token.safeTransferFrom(address(this), to, tokenId);
         emit ERC721Rescued(address(token), tokenId, to);
+    }
+
+    /// @notice Move an ERC-20 the vault holds to a chosen destination — for launch tokens whose transfer rules
+    ///         block a plain sweep to rewardSink (they only accept their registered distributor/router/pool).
+    ///         onlyOwner = the 48h Timelock, so every route is queued publicly first. Never a seat: reverts on
+    ///         the seat collection. (audit 41fa0208 #1)
+    function routeERC20(IERC20 token, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (address(token) == address(seatCollection)) revert CannotSweepSeats();
+        if (to == address(0)) revert ZeroAddress();
+        token.safeTransfer(to, amount);
+        emit ERC20Routed(address(token), to, amount);
     }
 
     /* ================================================================== *

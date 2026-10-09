@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test, console2} from "forge-std/Test.sol";
 import {HiveSeatVault, IImdAgentAdapter, IEnsReverseRegistrar} from "../src/HiveSeatVault.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @dev The live, audited IMDSeatStrategy (proxy "IMD6900") — we compare our pairing math against it.
 interface IRefStrategy {
@@ -13,6 +14,12 @@ interface IRefStrategy {
         returns (bytes32);
     function IMD_AGENT_ADAPTER() external view returns (address);
     function seatOperator() external view returns (address);
+}
+
+interface IRestrictedToken {
+    function owner() external view returns (address);
+    function setDistributor(address distributor, bool status) external;
+    function balanceOf(address) external view returns (uint256);
 }
 
 /**
@@ -114,5 +121,28 @@ contract HiveSeatVaultForkTest is Test {
         // Timelock corrects the URI through the live adapter (reverts here would mean a wrong ABI).
         vm.prank(timelock);
         vault.setAgentURI(SEAT, "ipfs://hive-agent-v2");
+    }
+
+    /// audit 41fa0208 #1 against the REAL restricted launch token (IMDSeatStrategy / "IMD6900"): a plain sweep to
+    /// the sink reverts InvalidTransfer, but the owner (the Timelock) can route it to a distributor the token has
+    /// whitelisted (its own allowlist: isDistributor / the global router list) — so nothing is ever stranded.
+    function test_fork_restricted_launch_token_routes_via_owner() public {
+        if (!forked) return;
+        IRestrictedToken lt = IRestrictedToken(REF_STRATEGY);
+        address distributor = makeAddr("whitelistedDistributor");
+        vm.prank(lt.owner()); // the token's real owner whitelists a distributor, exactly as it does for its routers
+        lt.setDistributor(distributor, true);
+
+        deal(address(lt), address(vault), 1000e18);
+        address[] memory t = new address[](1);
+        t[0] = address(lt);
+        vm.expectRevert(bytes4(0x2f352531)); // InvalidTransfer(): the token refuses a plain transfer to the sink
+        vault.sweepEarnings(t);
+        assertEq(lt.balanceOf(address(vault)), 1000e18);
+
+        vm.prank(timelock);
+        vault.routeERC20(IERC20(address(lt)), distributor, 1000e18);
+        assertEq(lt.balanceOf(address(vault)), 0);
+        assertEq(lt.balanceOf(distributor), 1000e18);
     }
 }

@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {HiveSeatVault, IImdAgentAdapter, IEnsReverseRegistrar} from "../src/HiveSeatVault.sol";
 
 contract TLSeat is ERC721 {
@@ -100,5 +101,90 @@ contract HiveSeatVaultTimelockTest is Test {
         vm.prank(executor);
         timelock.execute(address(vault), 0, data, bytes32(0), salt);
         assertEq(vault.seatOperator(), op);
+    }
+
+    /* ---- audit 41fa0208 #2: self-administration + a separate cancel-only guardian ---- */
+
+    /// Shortening the delay is possible only through a self-call that is ITSELF queued for the full 48h.
+    function test_delay_change_itself_waits_48h() public {
+        bytes memory data = abi.encodeCall(TimelockController.updateDelay, (0));
+        bytes32 salt = bytes32("zero-delay");
+        vm.prank(proposer);
+        timelock.schedule(address(timelock), 0, data, bytes32(0), salt, DELAY);
+        vm.prank(executor);
+        vm.expectRevert();
+        timelock.execute(address(timelock), 0, data, bytes32(0), salt);
+        assertEq(timelock.getMinDelay(), DELAY);
+    }
+
+    /// The routeERC20 exit is owner-only, so it is delayed like every other owner action.
+    function test_routeERC20_requires_48h() public {
+        bytes memory data = abi.encodeCall(HiveSeatVault.routeERC20, (IERC20(makeAddr("token")), holder, 1));
+        bytes32 salt = bytes32("route");
+        vm.prank(proposer);
+        timelock.schedule(address(vault), 0, data, bytes32(0), salt, DELAY);
+        vm.prank(executor);
+        vm.expectRevert();
+        timelock.execute(address(vault), 0, data, bytes32(0), salt);
+    }
+
+    function _guardedTimelock(address guardian) internal returns (TimelockController tl, HiveSeatVault v) {
+        address[] memory proposers = new address[](1);
+        proposers[0] = proposer;
+        address[] memory executors = new address[](1);
+        executors[0] = executor;
+        // exactly as the deploy script does it: temporary admin -> grant CANCELLER to guardian -> renounce
+        tl = new TimelockController(DELAY, proposers, executors, address(this));
+        tl.grantRole(tl.CANCELLER_ROLE(), guardian);
+        tl.renounceRole(tl.DEFAULT_ADMIN_ROLE(), address(this));
+        v = new HiveSeatVault(address(tl), IERC721(address(seat)), IImdAgentAdapter(makeAddr("adapter")), IEnsReverseRegistrar(address(0)), sink);
+        seat.mint(holder, 777);
+        vm.prank(holder);
+        seat.safeTransferFrom(holder, address(v), 777);
+    }
+
+    /// A separate guardian can cancel a queued withdrawal from a leaked proposer key, but can't queue or run anything.
+    function test_guardian_cancels_hostile_withdraw() public {
+        address guardian = makeAddr("guardian");
+        (TimelockController tl, HiveSeatVault v) = _guardedTimelock(guardian);
+        assertFalse(tl.hasRole(tl.DEFAULT_ADMIN_ROLE(), address(this)));
+        assertFalse(tl.hasRole(tl.PROPOSER_ROLE(), guardian));
+
+        bytes memory data = abi.encodeCall(HiveSeatVault.withdrawSeat, (777, proposer));
+        bytes32 salt = bytes32("hostile");
+        vm.prank(proposer);
+        tl.schedule(address(v), 0, data, bytes32(0), salt, DELAY);
+        bytes32 id = tl.hashOperation(address(v), 0, data, bytes32(0), salt);
+
+        vm.prank(guardian);
+        tl.cancel(id);
+        vm.warp(block.timestamp + DELAY);
+        vm.prank(executor);
+        vm.expectRevert();
+        tl.execute(address(v), 0, data, bytes32(0), salt);
+        assertEq(seat.ownerOf(777), address(v));
+
+        // the guardian itself cannot queue anything
+        vm.prank(guardian);
+        vm.expectRevert();
+        tl.schedule(address(v), 0, data, bytes32(0), bytes32("g"), DELAY);
+    }
+
+    /// ... and a queued delay change (the "zero the delay first" route) can be cancelled the same way.
+    function test_guardian_cancels_delay_change() public {
+        address guardian = makeAddr("guardian");
+        (TimelockController tl,) = _guardedTimelock(guardian);
+        bytes memory data = abi.encodeCall(TimelockController.updateDelay, (0));
+        bytes32 salt = bytes32("zero");
+        vm.prank(proposer);
+        tl.schedule(address(tl), 0, data, bytes32(0), salt, DELAY);
+        bytes32 id = tl.hashOperation(address(tl), 0, data, bytes32(0), salt);
+        vm.prank(guardian);
+        tl.cancel(id);
+        vm.warp(block.timestamp + DELAY);
+        vm.prank(executor);
+        vm.expectRevert();
+        tl.execute(address(tl), 0, data, bytes32(0), salt);
+        assertEq(tl.getMinDelay(), DELAY);
     }
 }

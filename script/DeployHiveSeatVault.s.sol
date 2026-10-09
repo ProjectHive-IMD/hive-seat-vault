@@ -7,17 +7,26 @@ import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {HiveSeatVault, IImdAgentAdapter, IEnsReverseRegistrar} from "../src/HiveSeatVault.sol";
 
 /**
- * @notice Deploys a 48h TimelockController (admin renounced) and the HiveSeatVault it owns, so EVERY seat
- *         exit and config change is a public, 48h-delayed operation — the backbone of the anti-rug guarantee
- *         (addresses audit finding #3: nothing in the contract itself pins the owner to a real timelock).
+ * @notice Deploys a 48h TimelockController and the HiveSeatVault it owns, so EVERY seat exit and config
+ *         change is a public, 48h-delayed operation — the backbone of the anti-rug guarantee (nothing in the
+ *         vault itself pins the owner to a real timelock; this script does, and fails if it doesn't hold).
  *
  *         Run against Ethereum mainnet, e.g.:
- *           HIVE_REWARD_SINK=0x... HIVE_TIMELOCK_PROPOSER=0x... \
+ *           HIVE_REWARD_SINK=0x... HIVE_TIMELOCK_PROPOSER=0x... HIVE_TIMELOCK_GUARDIAN=0x... \
  *           forge script script/DeployHiveSeatVault.s.sol --rpc-url $ETH_RPC_URL --broadcast
  *
- *         - admin = address(0): no one can shorten the delay or re-grant roles after deploy.
- *         - executor = address(0) (default): execution of a READY op is permissionless; only the proposer
- *           (the team key / multisig) can queue, and only after the 48h delay can anyone execute.
+ *         What the timelock does and does NOT guarantee (audit 41fa0208 #2 — stated precisely):
+ *         - Every operation, including one that targets the timelock ITSELF (updateDelay, grantRole,
+ *           revokeRole), must be queued publicly and waits the full 48h. OpenZeppelin's TimelockController
+ *           always administers itself (it grants DEFAULT_ADMIN_ROLE to address(this) whatever admin is passed),
+ *           so the proposer CAN shorten the delay or add roles — but only via such a self-call, which is
+ *           itself visible 48h ahead. Watch for any queued operation whose target is the timelock: that is the
+ *           exit signal. After such a change executes, later operations follow the new rules.
+ *         - No outside admin is left behind: the deployer never keeps DEFAULT_ADMIN_ROLE (checked below).
+ *         - HIVE_TIMELOCK_GUARDIAN (optional, recommended): a SEPARATE key granted only CANCELLER_ROLE. It can
+ *           cancel a queued operation (e.g. a hostile withdrawSeat or updateDelay from a leaked proposer key)
+ *           but cannot queue or execute anything. Without it, the proposer is the only canceller.
+ *         - executor = address(0) (default): execution of a READY op is permissionless.
  */
 contract DeployHiveSeatVault is Script {
     // identity.md mainnet addresses (collection is not a proxy; adapter = IMDSeatStrategy.IMD_AGENT_ADAPTER()).
@@ -28,8 +37,10 @@ contract DeployHiveSeatVault is Script {
     function run() external returns (TimelockController timelock, HiveSeatVault vault) {
         address rewardSink = vm.envAddress("HIVE_REWARD_SINK"); // where swept earnings go
         address proposer = vm.envAddress("HIVE_TIMELOCK_PROPOSER"); // team key / multisig that queues ops
+        address guardian = vm.envOr("HIVE_TIMELOCK_GUARDIAN", address(0)); // cancel-only key (optional)
         address executor = vm.envOr("HIVE_TIMELOCK_EXECUTOR", address(0)); // 0 = permissionless execution
         address ensRegistrar = vm.envOr("ENS_REVERSE_REGISTRAR", address(0)); // optional ENS branding
+        require(guardian != proposer, "guardian must be a separate key");
 
         address[] memory proposers = new address[](1);
         proposers[0] = proposer;
@@ -37,7 +48,13 @@ contract DeployHiveSeatVault is Script {
         executors[0] = executor;
 
         vm.startBroadcast();
-        timelock = new TimelockController(MIN_DELAY, proposers, executors, address(0)); // admin renounced
+        (, address deployer,) = vm.readCallers();
+        // A temporary deployer admin is needed only to grant the guardian; it is renounced in the same broadcast.
+        timelock = new TimelockController(MIN_DELAY, proposers, executors, guardian != address(0) ? deployer : address(0));
+        if (guardian != address(0)) {
+            timelock.grantRole(timelock.CANCELLER_ROLE(), guardian);
+            timelock.renounceRole(timelock.DEFAULT_ADMIN_ROLE(), deployer);
+        }
         vault = new HiveSeatVault(
             address(timelock),
             IERC721(SEAT_COLLECTION),
@@ -49,11 +66,18 @@ contract DeployHiveSeatVault is Script {
 
         console2.log("TimelockController:", address(timelock));
         console2.log("  minDelay (s):", timelock.getMinDelay());
+        console2.log("  guardian (cancel-only):", guardian);
         console2.log("HiveSeatVault:", address(vault));
         console2.log("  owner:", vault.owner());
 
         // fail the deploy if the trust assumptions behind the whole design are not actually in place
         require(vault.owner() == address(timelock), "owner must be the timelock");
         require(timelock.getMinDelay() == MIN_DELAY, "delay must be 48h");
+        require(!timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), deployer), "deployer must not keep admin");
+        require(!timelock.hasRole(timelock.DEFAULT_ADMIN_ROLE(), proposer), "proposer must not be admin");
+        if (guardian != address(0)) {
+            require(timelock.hasRole(timelock.CANCELLER_ROLE(), guardian), "guardian must be a canceller");
+            require(!timelock.hasRole(timelock.PROPOSER_ROLE(), guardian), "guardian must not propose");
+        }
     }
 }
